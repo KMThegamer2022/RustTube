@@ -1,0 +1,86 @@
+name: Build installers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-13]   # Apple Silicon, Intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - run: brew install mpv dylibbundler
+      - run: ./scripts/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rusttube-macos-${{ matrix.os }}
+          path: dist/*.dmg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Download libmpv (shinchiro builds)
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest
+          $asset = $rel.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-\d{8}' } | Select-Object -First 1
+          Invoke-WebRequest $asset.browser_download_url -OutFile mpv-dev.7z
+          7z x mpv-dev.7z -olibmpv -y | Out-Null
+          $dll = Get-ChildItem libmpv -Recurse -Filter 'libmpv-2.dll' | Select-Object -First 1
+          if (-not $dll) { throw "libmpv-2.dll not found in $($asset.name)" }
+          # Build an MSVC import library (mpv.lib) from the DLL's exports.
+          $names = dumpbin /exports $dll.FullName | ForEach-Object {
+            if ($_ -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)') { $Matches[1] }
+          }
+          "LIBRARY libmpv-2.dll`nEXPORTS`n" + ($names -join "`n") | Set-Content mpv.def -Encoding ascii
+          lib /def:mpv.def /machine:x64 /out:$($dll.DirectoryName)\mpv.lib
+          "MPV_DIR=$($dll.DirectoryName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = "-L native=$env:MPV_DIR"
+          cargo build --release
+
+      - name: Build installer (NSIS)
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          New-Item -ItemType Directory dist-win -Force | Out-Null
+          Copy-Item target\release\rusttube.exe dist-win\
+          Copy-Item "$env:MPV_DIR\libmpv-2.dll" dist-win\
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=$ver /DSRCDIR="$PWD\dist-win" packaging\windows\installer.nsi
+          Move-Item packaging\windows\RustTube-*-setup.exe . -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rusttube-windows
+          path: RustTube-*-setup.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
