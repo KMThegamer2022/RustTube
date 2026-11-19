@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15-intel]   # Apple Silicon (macOS 14+), Intel (macOS 15+)
+        os: [macos-15, macos-15-intel]   # both build against macOS 15 libraries
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

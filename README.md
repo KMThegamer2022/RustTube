@@ -25,7 +25,7 @@ Windows: pushed tags (`v*`) or a manual run of the **Build installers** workflow
 `RustTube-*-windows-x64-setup.exe` (NSIS) and the macOS `.dmg` files.
 
 ## Notes
-- The first macOS launch of an ad-hoc-signed app: right-click → Open.
+- macOS builds require macOS 15 or newer. The first launch of an ad-hoc-signed app: right-click → Open.
 - Streams come from YouTube's internal (unofficial) API, which can change without notice.
   If playback breaks, `src/yt.rs` (`streams`) is the place to update.
 - Debugging: `RUSTTUBE_AUTOPLAY=<video id>` opens a video at start; `RUSTTUBE_DEBUG=1` logs player state.
