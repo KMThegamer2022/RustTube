@@ -60,6 +60,14 @@ for f in "$APP/Contents/MacOS/RustTube" "$APP"/Contents/Frameworks/*.dylib; do
   done
 done
 
+# Record the oldest macOS the bundled libraries support, so older systems get a
+# clear "requires macOS X" message instead of a crash at launch.
+MINOS=$(for f in "$APP/Contents/MacOS/RustTube" "$APP"/Contents/Frameworks/*.dylib; do
+  otool -l "$f" | awk '/LC_BUILD_VERSION/{b=1} b&&/minos/{print $2; b=0}'
+done | sort -t. -k1,1n -k2,2n | tail -1)
+echo "Minimum macOS: $MINOS"
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MINOS" "$APP/Contents/Info.plist"
+
 # Ad-hoc sign (required to run on Apple Silicon). Replace "-" with a Developer ID
 # identity to distribute without Gatekeeper warnings.
 codesign --force --deep --sign - "$APP"

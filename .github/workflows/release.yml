@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15-intel]   # Apple Silicon, Intel
+        os: [macos-14, macos-15-intel]   # Apple Silicon (macOS 14+), Intel (macOS 15+)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,19 +48,46 @@ jobs:
           lib /def:mpv.def /machine:x64 /out:$($dll.DirectoryName)\mpv.lib
           "MPV_DIR=$($dll.DirectoryName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
+      - name: Get the Vulkan loader (libmpv imports vulkan-1.dll)
+        shell: pwsh
+        run: |
+          $vk = "$env:WINDIR\System32\vulkan-1.dll"
+          if (-not (Test-Path $vk)) {
+            choco install vulkan-runtime -y --no-progress
+          }
+          if (-not (Test-Path $vk)) { throw "vulkan-1.dll not found after install" }
+          New-Item -ItemType Directory dist-win -Force | Out-Null
+          Copy-Item $vk dist-win\vulkan-1.dll
+
       - name: Build
         shell: pwsh
         run: |
-          $env:RUSTFLAGS = "-L native=$env:MPV_DIR"
+          # Static CRT so the exe needs no Visual C++ redistributable.
+          $env:RUSTFLAGS = "-L native=$env:MPV_DIR -C target-feature=+crt-static"
           cargo build --release
 
       - name: Build installer (NSIS)
         shell: pwsh
         run: |
           choco install nsis -y --no-progress
-          New-Item -ItemType Directory dist-win -Force | Out-Null
           Copy-Item target\release\rusttube.exe dist-win\
           Copy-Item "$env:MPV_DIR\libmpv-2.dll" dist-win\
+          # Show what each binary imports, and fail if a non-system DLL is missing.
+          foreach ($f in "rusttube.exe","libmpv-2.dll","vulkan-1.dll") {
+            Write-Host "== $f"; dumpbin /dependents "dist-win\$f" | Select-String '\.dll'
+          }
+          $sys = Get-ChildItem "$env:WINDIR\System32" -Filter *.dll | ForEach-Object { $_.Name.ToLower() }
+          $have = Get-ChildItem dist-win -Filter *.dll | ForEach-Object { $_.Name.ToLower() }
+          $missing = @()
+          foreach ($f in "rusttube.exe","libmpv-2.dll") {
+            dumpbin /dependents "dist-win\$f" | ForEach-Object {
+              if ($_ -match '^\s+(\S+\.dll)\s*$') {
+                $d = $Matches[1].ToLower()
+                if ($d -notmatch '^(api-ms-|ext-ms-)' -and $sys -notcontains $d -and $have -notcontains $d) { $missing += $d }
+              }
+            }
+          }
+          if ($missing) { throw "Unbundled dependencies: $($missing -join ', ')" }
           $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=$ver /DSRCDIR="$PWD\dist-win" packaging\windows\installer.nsi
           Move-Item packaging\windows\RustTube-*-setup.exe . -Force
