@@ -1,18 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod player;
-mod proxy;
+mod embed;
 mod rec;
 mod store;
+mod webplayer;
 mod yt;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use eframe::egui::{self, Color32, RichText};
-use player::Player;
+use webplayer::WebPlayer;
 use store::{HistItem, Store, Sub};
-use yt::{ChannelInfo, Comment, Streams, VideoItem, WatchInfo};
+use yt::{ChannelInfo, Comment, VideoItem, WatchInfo};
 
 const RED: Color32 = Color32::from_rgb(255, 48, 48);
 const CATEGORIES: [(&str, &str); 8] = [
@@ -41,7 +41,6 @@ enum Msg {
     Results(u64, Result<Vec<VideoItem>, String>),
     Channel(u64, Result<ChannelInfo, String>),
     Watch(String, Result<WatchInfo, String>),
-    Streams(String, Result<Streams, String>),
     Comments(String, Result<(Vec<Comment>, Option<String>), String>),
     Thumb(String, Option<egui::ColorImage>),
 }
@@ -50,19 +49,16 @@ enum Msg {
 struct WatchState {
     id: String,
     info: Option<WatchInfo>,
-    streams: Option<Streams>,
     error: Option<String>,
-    quality: usize,
     comments: Vec<Comment>,
     comments_next: Option<String>,
     comments_loading: bool,
     desc_open: bool,
-    speed: f64,
     recorded: bool,
 }
 
 struct App {
-    player: Option<Player>,
+    player: Option<WebPlayer>,
     player_err: Option<String>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -79,12 +75,10 @@ struct App {
 
     watch: WatchState,
     fullscreen: bool,
-    last_mouse_move: f64,
     last_debug: f64,
     last_progress_save: f64,
     store: Store,
     new_profile: String,
-    volume: f32,
 
     thumbs: HashMap<String, egui::TextureHandle>,
     thumbs_pending: HashSet<String>,
@@ -93,7 +87,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_style(&cc.egui_ctx);
-        let (player, player_err) = match Player::new(cc) {
+        let (player, player_err) = match WebPlayer::new(cc) {
             Ok(p) => (Some(p), None),
             Err(e) => (None, Some(e)),
         };
@@ -113,12 +107,10 @@ impl App {
             error: None,
             watch: WatchState::default(),
             fullscreen: false,
-            last_mouse_move: 0.0,
             last_debug: 0.0,
             last_progress_save: 0.0,
             store: Store::load(),
             new_profile: String::new(),
-            volume: 100.0,
             thumbs: HashMap::new(),
             thumbs_pending: HashSet::new(),
         };
@@ -238,19 +230,14 @@ impl App {
             Page::Watch(id) => {
                 self.watch = WatchState {
                     id: id.clone(),
-                    speed: 1.0,
                     ..Default::default()
                 };
+                let resume = self.store.resume_pos(&id);
                 if let Some(p) = &mut self.player {
-                    p.stop();
+                    p.load(&id, resume);
                 }
-                let (tx1, ctx1, id1) = (tx.clone(), ctx.clone(), id.clone());
                 std::thread::spawn(move || {
-                    let _ = tx1.send(Msg::Watch(id1.clone(), yt::watch_info(&id1)));
-                    ctx1.request_repaint();
-                });
-                std::thread::spawn(move || {
-                    let _ = tx.send(Msg::Streams(id.clone(), yt::streams(&id)));
+                    let _ = tx.send(Msg::Watch(id.clone(), yt::watch_info(&id)));
                     ctx2.request_repaint();
                 });
             }
@@ -262,10 +249,10 @@ impl App {
             return;
         }
         if let Some(p) = &self.player {
-            let st = p.state();
-            if st.has_file && st.duration > 0.0 {
+            let st = p.status();
+            if st.dur > 0.0 {
                 let id = self.watch.id.clone();
-                self.store.set_progress(&id, st.pos, st.duration);
+                self.store.set_progress(&id, st.pos, st.dur);
                 self.store.save();
             }
         }
@@ -275,7 +262,7 @@ impl App {
         if self.watch.recorded {
             return;
         }
-        let (Some(info), Some(s)) = (&self.watch.info, &self.watch.streams) else {
+        let Some(info) = &self.watch.info else {
             return;
         };
         let item = HistItem {
@@ -283,10 +270,10 @@ impl App {
             title: info.title.clone(),
             channel: info.channel.clone(),
             channel_id: info.channel_id.clone(),
-            length: fmt_time(s.duration),
+            length: String::new(),
             watched_at: store::now_secs(),
             pos: 0.0,
-            duration: s.duration,
+            duration: 0.0,
         };
         self.watch.recorded = true;
         self.store.record_watch(item);
@@ -320,19 +307,6 @@ impl App {
         });
     }
 
-    fn start_stream(&mut self, start: f64) {
-        let (Some(player), Some(s)) = (&mut self.player, &self.watch.streams) else {
-            return;
-        };
-        let q = self.watch.quality.min(s.video.len().saturating_sub(1));
-        let v = &s.video[q];
-        let video_url = proxy::register(&v.url, v.len);
-        let audio_url = proxy::register(&s.audio_url, s.audio_len);
-        player.load(&video_url, &audio_url, start);
-        player.set_volume(self.volume as f64);
-        player.set_speed(self.watch.speed);
-    }
-
     fn pump(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -359,17 +333,6 @@ impl App {
                             self.load_comments(ctx, t);
                         }
                         self.watch.info = Some(info);
-                        self.record_if_ready();
-                    }
-                    Err(e) => self.watch.error = Some(e),
-                },
-                Msg::Streams(id, r) if id == self.watch.id => match r {
-                    Ok(s) => {
-                        // Default to the best quality up to 1080p.
-                        self.watch.quality = s.video.iter().position(|f| f.height <= 1080).unwrap_or(0);
-                        self.watch.streams = Some(s);
-                        let resume = self.store.resume_pos(&id);
-                        self.start_stream(resume);
                         self.record_if_ready();
                     }
                     Err(e) => self.watch.error = Some(e),
@@ -704,135 +667,12 @@ impl App {
         }
     }
 
-    fn player_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, width: f32, height: f32) {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
-        ui.painter().rect_filled(rect, if self.fullscreen { 0.0 } else { 10.0 }, Color32::BLACK);
-        let st = self.player.as_ref().map(|p| p.state()).unwrap_or_default();
-        if let Some(p) = &self.player {
-            if st.has_file {
-                p.paint(ui, rect);
-            }
+    fn player_area(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+        if let Some(p) = &mut self.player {
+            p.show_at(rect);
         }
-        if resp.clicked() {
-            if let Some(p) = &self.player {
-                p.toggle_pause();
-            }
-        }
-        if resp.double_clicked() {
-            self.set_fullscreen(ctx, !self.fullscreen);
-        }
-        if ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) && resp.hovered() {
-            self.last_mouse_move = ctx.input(|i| i.time);
-        }
-        let now = ctx.input(|i| i.time);
-        let show_controls = !self.fullscreen || now - self.last_mouse_move < 2.5 || st.paused;
-
-        if st.buffering || (!st.has_file && self.watch.error.is_none()) {
-            ui.put(
-                egui::Rect::from_center_size(rect.center(), egui::vec2(40.0, 40.0)),
-                egui::Spinner::new().size(36.0),
-            );
-        }
-        if let Some(e) = &self.watch.error {
-            ui.put(
-                rect.shrink(20.0),
-                egui::Label::new(RichText::new(format!("Can't play this video:\n{e}")).color(Color32::LIGHT_RED)),
-            );
-        }
-        if st.has_file && st.paused && !st.buffering {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                if st.ended { "⟲" } else { "⏵" },
-                egui::FontId::proportional(64.0),
-                Color32::from_white_alpha(200),
-            );
-        }
-        if show_controls && st.has_file {
-            self.controls(ui, ctx, rect, st);
-        }
-        if self.fullscreen && !show_controls {
-            ctx.set_cursor_icon(egui::CursorIcon::None);
-        }
-    }
-
-    fn controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, rect: egui::Rect, st: player::PlayState) {
-        let bar = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 64.0), rect.right_bottom());
-        ui.painter().rect_filled(bar, 0.0, Color32::from_black_alpha(150));
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(egui::vec2(12.0, 6.0))));
-        let ui = &mut child;
-        // Seek bar
-        let mut pos = st.pos as f32;
-        let dur = st.duration.max(1.0) as f32;
-        ui.spacing_mut().slider_width = ui.available_width();
-        let slider = ui.add(egui::Slider::new(&mut pos, 0.0..=dur).show_value(false).trailing_fill(true));
-        if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
-            if let Some(p) = &self.player {
-                p.seek_abs(pos as f64);
-            }
-        }
-        ui.horizontal(|ui| {
-            if ui.button(if st.paused { "⏵" } else { "⏸" }).clicked() {
-                if let Some(p) = &self.player {
-                    p.toggle_pause();
-                }
-            }
-            ui.label(RichText::new(format!("{} / {}", fmt_time(st.pos), fmt_time(st.duration))).color(Color32::WHITE));
-            ui.add_space(8.0);
-            ui.label("🔊");
-            ui.spacing_mut().slider_width = 90.0;
-            let mut vol = self.volume;
-            if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0).show_value(false)).changed() {
-                self.volume = vol;
-                if let Some(p) = &self.player {
-                    p.set_volume(vol as f64);
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(if self.fullscreen { "⛶ Exit" } else { "⛶" }).clicked() {
-                    self.set_fullscreen(ctx, !self.fullscreen);
-                }
-                // Speed
-                let mut speed = self.watch.speed;
-                egui::ComboBox::from_id_salt("speed")
-                    .selected_text(format!("{speed}x"))
-                    .width(60.0)
-                    .show_ui(ui, |ui| {
-                        for s in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0] {
-                            ui.selectable_value(&mut speed, s, format!("{s}x"));
-                        }
-                    });
-                if speed != self.watch.speed {
-                    self.watch.speed = speed;
-                    if let Some(p) = &self.player {
-                        p.set_speed(speed);
-                    }
-                }
-                // Quality
-                if let Some(s) = &self.watch.streams {
-                    let cur = self.watch.quality.min(s.video.len().saturating_sub(1));
-                    let mut sel = cur;
-                    egui::ComboBox::from_id_salt("quality")
-                        .selected_text(format!("{}p", s.video[cur].height))
-                        .width(70.0)
-                        .show_ui(ui, |ui| {
-                            for (i, f) in s.video.iter().enumerate() {
-                                let label = if f.fps > 30 {
-                                    format!("{}p{}", f.height, f.fps)
-                                } else {
-                                    format!("{}p", f.height)
-                                };
-                                ui.selectable_value(&mut sel, i, label);
-                            }
-                        });
-                    if sel != cur {
-                        self.watch.quality = sel;
-                        let at = st.pos;
-                        self.start_stream(at);
-                    }
-                }
-            });
-        });
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
@@ -847,8 +687,15 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(Color32::BLACK))
                 .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("⤡ Exit fullscreen").clicked() {
+                            self.set_fullscreen(ctx, false);
+                        }
+                        let t = self.watch.info.as_ref().map(|i| i.title.clone()).unwrap_or_default();
+                        ui.label(RichText::new(t).color(Color32::from_gray(200)));
+                    });
                     let r = ui.available_size();
-                    self.player_area(ui, ctx, r.x, r.y);
+                    self.player_area(ui, r.x, r.y);
                 });
             return;
         }
@@ -872,23 +719,37 @@ impl App {
                 });
             });
 
+        let pstatus = self.player.as_ref().map(|p| p.status()).unwrap_or_default();
         egui::CentralPanel::default().show(ctx, |ui| {
+            let w = ui.available_width() - 6.0;
+            let h = (w * 9.0 / 16.0).min(ctx.screen_rect().height() * 0.62);
+            let w = h * 16.0 / 9.0;
+            self.player_area(ui, w, h);
+            ui.add_space(6.0);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let w = ui.available_width() - 6.0;
-                let h = (w * 9.0 / 16.0).min(ctx.screen_rect().height() * 0.72);
-                let w = h * 16.0 / 9.0;
-                self.player_area(ui, ctx, w, h);
-                ui.set_max_width(w);
-                ui.add_space(10.0);
+                ui.set_max_width(w.max(300.0));
+                if matches!(pstatus.error, 101 | 150 | 152) {
+                    ui.colored_label(
+                        Color32::LIGHT_RED,
+                        "The owner of this video doesn't allow it to play outside YouTube.",
+                    );
+                }
 
                 let title = self
                     .watch
                     .info
                     .as_ref()
                     .map(|i| i.title.clone())
-                    .or_else(|| self.watch.streams.as_ref().map(|s| s.title.clone()))
                     .unwrap_or_default();
                 ui.label(RichText::new(title).size(21.0).strong());
+                ui.horizontal(|ui| {
+                    if ui.button("⛶ Fullscreen").clicked() {
+                        self.set_fullscreen(ctx, true);
+                    }
+                    if ui.button("Open on YouTube").clicked() {
+                        open_url(&format!("https://www.youtube.com/watch?v={}", self.watch.id));
+                    }
+                });
                 ui.add_space(8.0);
 
                 if let Some(info) = self.watch.info.clone() {
@@ -986,64 +847,13 @@ impl App {
         }
     }
 
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        if !matches!(self.page(), Page::Watch(_)) || ctx.wants_keyboard_input() {
-            return;
-        }
-        let (space, left, right, up, down, f, esc, j, l, m) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::K),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::F),
-                i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::J),
-                i.key_pressed(egui::Key::L),
-                i.key_pressed(egui::Key::M),
-            )
-        });
-        let Some(p) = &self.player else { return };
-        if space {
-            p.toggle_pause();
-        }
-        if left {
-            p.seek_rel(-5.0);
-        }
-        if right {
-            p.seek_rel(5.0);
-        }
-        if j {
-            p.seek_rel(-10.0);
-        }
-        if l {
-            p.seek_rel(10.0);
-        }
-        if up || down {
-            self.volume = (self.volume + if up { 5.0 } else { -5.0 }).clamp(0.0, 100.0);
-            p.set_volume(self.volume as f64);
-        }
-        if m {
-            self.volume = if self.volume > 0.0 { 0.0 } else { 100.0 };
-            p.set_volume(self.volume as f64);
-        }
-        if f {
-            self.set_fullscreen(ctx, !self.fullscreen);
-        }
-        if esc && self.fullscreen {
-            self.set_fullscreen(ctx, false);
-        }
-    }
 }
 
-fn fmt_time(secs: f64) -> String {
-    let s = secs.max(0.0) as u64;
-    if s >= 3600 {
-        format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
-    } else {
-        format!("{}:{:02}", s / 60, s % 60)
-    }
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
 }
 
 /// Add OS fonts as fallbacks so non-Latin titles (CJK, Tamil, Arabic, ...) render.
@@ -1103,13 +913,12 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump(ctx);
-        self.shortcuts(ctx);
 
         if let Some(e) = self.player_err.clone() {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("RustTube can't start its video engine");
+                ui.heading("RustTube can't start its video player");
                 ui.label(e);
-                ui.label("Make sure libmpv is installed (macOS: `brew install mpv`; Windows: libmpv-2.dll next to the app).");
+                ui.label("On Windows, install the Microsoft Edge WebView2 Runtime and try again.");
             });
             return;
         }
@@ -1129,7 +938,7 @@ impl eframe::App for App {
             if t - self.last_debug > 1.0 {
                 self.last_debug = t;
                 if let Some(p) = &self.player {
-                    eprintln!("[debug] {:?} results={} err={:?}", p.state(), self.results.len(), self.watch.error);
+                    eprintln!("[debug] {:?} results={} err={:?}", p.status(), self.results.len(), self.watch.error);
                 }
             }
         }
@@ -1140,9 +949,10 @@ impl eframe::App for App {
                 self.save_progress();
             }
         }
-        if watching {
-            // Keep the seek bar and clock moving.
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if !watching {
+            if let Some(p) = &mut self.player {
+                p.hide();
+            }
         }
     }
 }

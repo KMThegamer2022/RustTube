@@ -4,7 +4,6 @@
 
 use serde_json::{json, Value};
 
-pub const VR_UA: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 const WEB_VERSION: &str = "2.20250101.00.00";
 
 #[derive(Clone, Debug, Default)]
@@ -48,24 +47,6 @@ pub struct ChannelInfo {
     pub description: String,
     pub avatar: String,
     pub videos: Vec<VideoItem>,
-}
-
-#[derive(Clone, Debug)]
-pub struct VideoFormat {
-    pub height: u32,
-    pub fps: u32,
-    pub url: String,
-    pub len: u64,
-    pub is_avc: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Streams {
-    pub title: String,
-    pub duration: f64,
-    pub video: Vec<VideoFormat>,
-    pub audio_url: String,
-    pub audio_len: u64,
 }
 
 type Res<T> = Result<T, String>;
@@ -358,84 +339,8 @@ pub fn comments(token: &str) -> Res<(Vec<Comment>, Option<String>)> {
     Ok((list, next))
 }
 
-/// Resolve direct stream URLs. Uses the Android VR client, which currently
-/// returns playable adaptive formats without extra signature work.
-pub fn streams(video_id: &str) -> Res<Streams> {
-    let body = json!({
-        "context": {"client": {
-            "clientName": "ANDROID_VR", "clientVersion": "1.65.10",
-            "deviceModel": "Quest 3", "osVersion": "12L", "androidSdkVersion": 32, "hl": "en"
-        }},
-        "videoId": video_id,
-        "contentCheckOk": true, "racyCheckOk": true
-    });
-    let v = post("player", body, Some(VR_UA))?;
-    let status = v.pointer("/playabilityStatus/status").and_then(Value::as_str).unwrap_or("?");
-    if status != "OK" {
-        let reason = v.pointer("/playabilityStatus/reason").and_then(Value::as_str).unwrap_or("not playable");
-        return Err(format!("{status}: {reason}"));
-    }
-    let adaptive = v
-        .pointer("/streamingData/adaptiveFormats")
-        .and_then(Value::as_array)
-        .ok_or("no streams returned")?;
-
-    let mut video = Vec::new();
-    let mut best_audio: Option<(u64, String, u64)> = None;
-    for f in adaptive {
-        let (Some(url), Some(mime)) = (
-            f.get("url").and_then(Value::as_str),
-            f.get("mimeType").and_then(Value::as_str),
-        ) else {
-            continue;
-        };
-        if mime.starts_with("video/") {
-            video.push(VideoFormat {
-                height: f.get("height").and_then(Value::as_u64).unwrap_or(0) as u32,
-                fps: f.get("fps").and_then(Value::as_u64).unwrap_or(30) as u32,
-                url: url.to_string(),
-                len: content_len(f),
-                is_avc: mime.contains("avc1"),
-            });
-        } else if mime.starts_with("audio/mp4") {
-            let br = f.get("bitrate").and_then(Value::as_u64).unwrap_or(0);
-            if best_audio.as_ref().map_or(true, |(b, _, _)| br > *b) {
-                best_audio = Some((br, url.to_string(), content_len(f)));
-            }
-        }
-    }
-    // Prefer H.264 (hardware decode everywhere); keep other codecs as fallback.
-    video.sort_by(|a, b| b.height.cmp(&a.height).then(b.is_avc.cmp(&a.is_avc)));
-    video.dedup_by(|a, b| a.height == b.height && !(a.is_avc && !b.is_avc));
-    if video.iter().any(|f| f.is_avc) {
-        video.retain(|f| f.is_avc);
-    }
-    let (_, audio_url, audio_len) = best_audio.ok_or("no audio stream")?;
-    if video.is_empty() {
-        return Err("no video stream".into());
-    }
-    Ok(Streams {
-        title: v.pointer("/videoDetails/title").and_then(Value::as_str).unwrap_or("").into(),
-        duration: v
-            .pointer("/videoDetails/lengthSeconds")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0),
-        video,
-        audio_url,
-        audio_len,
-    })
-}
-
 /// Fetch raw bytes (thumbnails, avatars).
 pub fn fetch_bytes(url: &str) -> Res<Vec<u8>> {
     let mut resp = ureq::get(url).call().map_err(|e| e.to_string())?;
     resp.body_mut().read_to_vec().map_err(|e| e.to_string())
-}
-
-fn content_len(f: &Value) -> u64 {
-    f.get("contentLength")
-        .and_then(Value::as_str)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
 }

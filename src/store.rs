@@ -184,6 +184,14 @@ impl Store {
             h.pos = pos;
             if duration > 0.0 {
                 h.duration = duration;
+                if h.length.is_empty() {
+                    let t = duration as u64;
+                    h.length = if t >= 3600 {
+                        format!("{}:{:02}:{:02}", t / 3600, (t / 60) % 60, t % 60)
+                    } else {
+                        format!("{}:{:02}", t / 60, t % 60)
+                    };
+                }
             }
         }
     }

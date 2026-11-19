@@ -2,6 +2,7 @@
 ;   makensis /DVERSION=0.1.0 /DSRCDIR=<dir with rusttube.exe + libmpv-2.dll> installer.nsi
 Unicode true
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
 
 !ifndef VERSION
   !define VERSION "0.1.0"
@@ -30,8 +31,24 @@ SetCompressor /SOLID lzma
 Section "Install"
   SetOutPath "$INSTDIR"
   File "${SRCDIR}\rusttube.exe"
-  File "${SRCDIR}\libmpv-2.dll"
-  File "${SRCDIR}\vulkan-1.dll"
+
+  ; RustTube plays video in the Microsoft Edge WebView2 runtime (preinstalled on
+  ; Windows 11 and current Windows 10). Install it if it is missing.
+  ReadRegStr $0 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+  ${If} $0 == ""
+    ReadRegStr $0 HKCU "Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+  ${EndIf}
+  ${If} $0 == ""
+  ${OrIf} $0 == "0.0.0.0"
+    DetailPrint "Installing Microsoft Edge WebView2 runtime..."
+    NSISdl::download "https://go.microsoft.com/fwlink/p/?LinkId=2124703" "$TEMP\MicrosoftEdgeWebview2Setup.exe"
+    Pop $1
+    ${If} $1 == "success"
+      ExecWait '"$TEMP\MicrosoftEdgeWebview2Setup.exe" /silent /install'
+    ${Else}
+      MessageBox MB_OK|MB_ICONEXCLAMATION "Could not download the WebView2 runtime. Install it from https://developer.microsoft.com/microsoft-edge/webview2/ and start RustTube again."
+    ${EndIf}
+  ${EndIf}
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\RustTube"
@@ -50,8 +67,6 @@ SectionEnd
 
 Section "Uninstall"
   Delete "$INSTDIR\rusttube.exe"
-  Delete "$INSTDIR\libmpv-2.dll"
-  Delete "$INSTDIR\vulkan-1.dll"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   Delete "$SMPROGRAMS\RustTube\RustTube.lnk"
